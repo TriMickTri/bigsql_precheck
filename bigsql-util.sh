@@ -54,6 +54,10 @@ logLevel=0
 #------------------------------------------------------------
 THIS_HOST=$(hostname -f)
 
+TMP=/tmp
+# Place log files in /var/logs/bigsql by default
+BASE_LOG_DIR="/var/log"
+
 #------------------------------------------------------------
 # Temporary files and log files
 #------------------------------------------------------------
@@ -66,6 +70,29 @@ get_timestamp()
 ################################################################################
 # 2 - util functions
 ################################################################################
+
+#------------------------------------------------------------
+# get_sudo_cmd
+#
+# When running as root we should not perform sudo.
+# This wrapper will return the sudo command that
+# should be used by the caller, either 'sudo' or
+# the empty string.
+#------------------------------------------------------------
+get_sudo_cmd()
+{
+   local SUDO_CMD=""
+
+   # Do not sudo when running as root
+   if [[ $EUID -eq 0 ]]; then
+     SUDO_CMD=""
+   else
+     SUDO_CMD="sudo"
+   fi
+
+   echo $SUDO_CMD
+}
+
 log_info()
 {
    LINE="${BASH_LINENO[0]}"
@@ -516,9 +543,14 @@ bigsql_getMaxMlnCount()
 #################################################
 createLogDirIfNotExist()
 {
-   local scriptLog=$1
-   local scriptLogDir=`dirname $scriptLog`
+   local scriptLog=$1                                # /<...>/bigsql/logs/<logfile>
+   local scriptLogDir=`dirname $scriptLog`           # /<...>/bigsql/logs
+   local scriptLogDirBase=`basename $scriptLogDir`   # logs
+   local scriptLogRoot=`dirname $scriptLogDir`       # /<...>/bigsql
+   local scriptLogRootBase=`basename $scriptLogRoot` # bigsql
    local sudo_cmd=""
+
+   BIGSQL_GROUP=`id -gn ${BIGSQL_USER}`
 
    ##############################################
    # Check sudo access for user
@@ -543,6 +575,16 @@ createLogDirIfNotExist()
    #############################################
    ${sudo_cmd} mkdir -p ${scriptLogDir} > /dev/null 2>&1
    ${sudo_cmd} chmod 777 ${scriptLogDir} > /dev/null 2>&1
+
+   # Only chmod/chown the exact bigsql level directory
+   # There are cases where /<>/bigsql is not writable by the bigsql user and this
+   # causes the hcat client to fail
+   if [[ ${scriptLogDirBase} == "logs" ]] &&
+      [[ ${scriptLogRootBase} == ${BIGSQL_USER} ]]
+   then
+      ${sudo_cmd} chmod 777 ${scriptLogRoot} > /dev/null 2>&1
+      ${sudo_cmd} chown ${BIGSQL_USER}:${BIGSQL_GROUP} ${scriptLogRoot} > /dev/null 2>&1
+   fi
 }
 
 alterScriptLogWithFallback()
@@ -565,7 +607,8 @@ alterScriptLogWithFallback()
    # making sure it is writable we can't assume
    # good intentions only.
    ################################################
-   if [[ ${SCRIPT_LOG} == "/tmp"* ]]
+   if [[ ${SCRIPT_LOG} == "/tmp"* ]] ||
+      [[ ${SCRIPT_LOG} == "/var/log"* ]]
    then
       ###############################################
       # If specified then check if dir exist
@@ -1017,23 +1060,17 @@ renew_kerberos_ticket()
    local cmd=0
    local rc=0
 
-   kerberosLogFile=/tmp/bigsql-kinit.log
+   kerberosLogFile=${BASE_LOG_DIR}/${BIGSQL_USER}/logs/bigsql-kinit.log
 
    . ${BIGSQL_HOME}/libexec/include-ctl.sh
 
    if [[ ! -z ${SCRIPT_LOG} ]]
    then
       kerberosLogFile=${SCRIPT_LOG}
-   else
-      if [[ ! -z ${OPERATION_LOG} ]] 
-      then
-         kerberosLogFile=${OPERATION_LOG}
-      fi
    fi
 
    thisHost=`hostname --long`
    echo "Running on host: $thisHost" >  ${kerberosLogFile}
-
 
    echo "Checking Big SQL Service Config"  >> ${kerberosLogFile}
    client_conf="${BIGSQL_HOME}/conf/bigsql-conf.xml"
@@ -1126,7 +1163,7 @@ switchToServiceMode()
   
     if [[ -z ${SCRIPT_LOG} ]]
     then
-       SCRIPT_LOG=/tmp/bigsql_switchToServiceMode.log.$$
+       SCRIPT_LOG=${BASE_LOG_DIR}/${BIGSQL_USER}/logs/bigsql_switchToServiceMode.log.$$
        rm -f  ${SCRIPT_LOG}
     fi
 
@@ -1169,10 +1206,34 @@ switchToServiceMode()
          log "$FUNCNAME" "Failed to switch service mode with rc=[$result]"
          #####################################################
          # Service mode would fail if there is no worker up left
+         # attempt to get at least one worker up.
          #####################################################
-         workerNode=`head -2 ~/sqllib/db2nodes.cfg | tail  -1 |cut -d' ' -f1`
-         log "$FUNCNAME" "Starting first worker ${workerNode}"
-         bigsql start -n ${workerNode}  >> ${SCRIPT_LOG}
+         nodesFile=~/sqllib/db2nodes.cfg
+         totalNodes=$(cat ${nodesFile} | wc -l)
+         numWorkers=$((totalNodes-1))
+         log_echo "Total Number of nodes  : ${totalNodes}"
+         log_echo "Total Number of workers: ${numWorkers}"
+         log_echo ""
+         for ((nodes=0; nodes<=${numWorkers}; nodes++))
+         do
+ 
+           #############################################
+           # Traverse workers in nodes.cfg until 
+           # one succesful start is done.
+           #############################################
+           topLine=$((2 + nodes))
+           workerNode=`head -$topLine ${nodesFile} | tail  -1 |cut -d' ' -f1`
+           log_echo "Attempting to start WorkerNode:${workerNode}" 
+
+           bigsql start -n ${workerNode} >> ${SCRIPT_LOG}
+           startResult=$?
+           if [[ ${startResult} -eq 0 ]]
+           then
+             log_echo "Successfully started WorkerNode:${workerNode}"
+             break;
+           fi
+ 
+         done
          #####################################################
          # Service mode would fail if db is not activated
          #####################################################
