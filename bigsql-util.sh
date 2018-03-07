@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# MICK
+#
 # Licensed Materials - Property of IBM
 #
 # "Restricted Materials of IBM"
@@ -32,6 +32,12 @@
 UTIL_SSH_CMD="ssh -o LogLevel=error -o StrictHostKeyChecking=no -o PasswordAuthentication=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
 ROOT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 
+# Signal handler for sigint and sigterm
+if [[ -f "${ROOT_DIR}/bigsql-sig.sh" ]]
+then
+. $ROOT_DIR/bigsql-sig.sh
+fi
+
 # Do not sudo when running as root
 if [[ $EUID -eq 0 ]]; then
     SUDO_CMD=""
@@ -44,6 +50,7 @@ fi
 BIGSQL_RC_NO_LOG_USER=100
 BIGSQL_RC_NO_LOG_DIR=101
 
+
 #---------------------------------------------------
 # LOG LEVEL
 #---------------------------------------------------
@@ -55,7 +62,7 @@ logLevel=0
 THIS_HOST=$(hostname -f)
 
 TMP=/tmp
-# Place log files in /var/logs/bigsql by default
+# Place log files in /var/log/bigsql by default
 BASE_LOG_DIR="/var/log"
 
 #------------------------------------------------------------
@@ -1286,5 +1293,113 @@ no_user_data()
   fi
 
   return $rc
+}
+
+#########################################################
+# Parallel Exec Utilities
+#########################################################
+getHeadNode()
+{
+  local BIGSQL_USER_HOME=$(eval echo ~${BIGSQL_USER})
+  local BIGSQL_SQLLIB="$BIGSQL_USER_HOME/sqllib"
+  local BIGSQL_NODES_FILE="$BIGSQL_SQLLIB/db2nodes.cfg"
+
+  if [[ -f "${BIGSQL_NODES_FILE}" ]]
+  then
+    headNode=`cat "${BIGSQL_NODES_FILE}" | sed 's/ \+/\,/g' | grep "^0" | cut -d',' -f2 | sort -n`
+    printf "%s" $headNode
+  fi
+}
+
+getBigSQLWorkerHosts()
+{
+  local BIGSQL_USER_HOME=$(eval echo ~${BIGSQL_USER})
+  local BIGSQL_SQLLIB="$BIGSQL_USER_HOME/sqllib"
+  local BIGSQL_NODES_FILE="$BIGSQL_SQLLIB/db2nodes.cfg"
+
+  if [[ -f "${BIGSQL_NODES_FILE}" ]]
+  then
+    workerHosts=`cat "${BIGSQL_NODES_FILE}" | sed 's/ \+/\,/g' | grep -v "^0" | cut -d',' -f2 | sort | uniq`
+    printf "%s " $workerHosts
+  fi
+}
+
+getAllBigSQLHosts()
+{
+  local BIGSQL_USER_HOME=$(eval echo ~${BIGSQL_USER})
+  local BIGSQL_SQLLIB="$BIGSQL_USER_HOME/sqllib"
+  local BIGSQL_NODES_FILE="$BIGSQL_SQLLIB/db2nodes.cfg"
+
+  if [[ -f "${BIGSQL_NODES_FILE}" ]]
+  then
+    allHosts=`cat "${BIGSQL_NODES_FILE}" | sed 's/ \+/\,/g' | cut -d',' -f2 | sort | uniq`
+    printf "%s " $allHosts
+  fi
+}
+
+pExec()
+{
+    declare -a pidsToWait
+    index=0
+
+    if [[ -z "${1}" ]]
+    then 
+       log_echo "$FUNCNAME" "Host list is not provided"
+       exit 1
+    fi
+
+    if [[ -z "${2}" ]]
+    then 
+       log_echo "$FUNCNAME" "Command to run is not provided"
+       exit 1
+    fi
+
+    local HOSTS="${1}"
+    local CMD="${2}"
+
+    logLevel=$((logLevel+1))
+    log "${FUNCNAME}" "Start"
+    log "${FUNCNAME}" "Exec:${CMD} at HOSTS:${HOSTS}"
+
+    local rc=0
+
+    #
+    #  Run cmd in parallel at hostlist
+    #
+    for host in  `echo ${HOSTS}`
+    do
+      log_echo "${FUNCNAME}" "Executing at host:${host} cmd:${CMD}"
+      ${UTIL_SSH_CMD} ${host} sh -c \"${CMD}\" >> ${SCRIPT_LOG} 2>&1 &  
+      pidsToWait[$index]=$!
+      msgIndex[$index]=$host
+      log "${FUNCNAME}" "Spawned child process ${pidsToWait[$index]}"
+      index=$((index+1))
+    done
+
+    #
+    # Wait for processes to finish executing
+    #
+    numLoop=${#pidsToWait[@]}
+    log "${FUNCNAME}" "Total number of processes:$numLoop"
+    for ((index=0; index<$numLoop; index++))
+    do
+      log "${FUNCNAME}" "Waiting for process ${pidsToWait[$index]}"
+      wait ${pidsToWait[$index]}
+      pidRc=$?
+      if [[ $pidRc -ne 0 ]] 
+      then
+        currentHost=`hostname --long`
+        log_echo "${FUNCNAME}" "CMD:$CMD Result:Failed at ${msgIndex[$index]}."
+        rc=1
+      else
+        log_echo "${FUNCNAME}" "CMD:$CMD Result:Success at ${msgIndex[$index]}."
+      fi
+    done
+
+
+    log "${FUNCNAME}" "Completed exec with $rc"
+    logLevel=$((logLevel-1))
+
+    return $rc
 }
 
