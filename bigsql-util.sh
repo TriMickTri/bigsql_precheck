@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-#
+# MICK
 # Licensed Materials - Property of IBM
 #
 # "Restricted Materials of IBM"
